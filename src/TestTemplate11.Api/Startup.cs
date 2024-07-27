@@ -145,7 +145,7 @@ namespace TestTemplate11.Api
                     //            o.ConnectionString = "InstrumentationKey=f051d7dd-dbaf-450a-a6f1-9f78bc0f8c91;IngestionEndpoint=https://westeurope-5.in.applicationinsights.azure.com/;LiveEndpoint=https://westeurope.livediagnostics.monitor.azure.com/";
                     //        })
                     //        .AddConsoleExporter();
-                    //})
+                    //})  
                     .StartWithHost();
             }
 
