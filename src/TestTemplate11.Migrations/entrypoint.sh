@@ -1,0 +1,1 @@
+./src/wait-for-it.sh testtemplate11.sql:5432 --timeout=0 --strict -- sleep 5s && dotnet ./TestTemplate11.Migrations.dll

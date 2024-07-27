@@ -1,0 +1,219 @@
+trigger: none
+pr: none
+
+# Pipeline resource defined as per https://bit.ly/3PhwhRk
+resources:
+  pipelines:
+  - pipeline: build_pipeline        # Used to reference the pipeline reference from other parts of the code.
+    source: build_pipeline  	# This must match  the build pipeline name in ADO.
+                                    # By default, pipelines are named after the ADO build pipeline name.
+    trigger:
+      branches:
+      - master                      # Will get triggered whenever the source pipeline runs on master branch.
+
+jobs:
+- deployment: TestTemplate11_deploy_to_appservice
+  displayName: TestTemplate11 Deploy to AppService
+  environment: production
+  variables:
+    adoProject: 'TestTemplate11'
+    azureServiceConnection: 'AzureConnection'
+  pool:
+    vmImage: 'ubuntu-latest'
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+          fetchDepth: 0
+
+        - script: pwd
+          displayName: 'Basic Information - pwd'
+
+        - script: ls -al
+          displayName: 'Basic Information - Directory Contents'
+
+        - task: PowerShell@2
+          displayName: 'Create version number'
+          name: 'CreateVersionNumber'
+          inputs:
+            targetType: 'inline'
+            script: |
+              $newVersion = "$(resources.pipeline.build_pipeline.runName)"
+              [string] $buildName = "$($newVersion)"
+              Write-Host "##vso[build.updatebuildnumber]$buildName"
+
+        - download: none
+
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download Artifact TestTemplate11.Api'
+          inputs:
+            buildType: 'specific'
+            definition: build_pipeline
+            buildVersionToDownload: 'latest'
+            artifactName: 'drop.TestTemplate11.Api'
+            project: '$(adoProject)'
+            downloadPath: '$(Pipeline.Workspace)/drop/TestTemplate11.Api'
+
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download Artifact TestTemplate11.WorkerServices'
+          inputs:
+            buildType: 'specific'
+            definition: build_pipeline
+            buildVersionToDownload: 'latest'
+            artifactName: 'drop.TestTemplate11.WorkerServices'
+            project: '$(adoProject)'
+            downloadPath: '$(Pipeline.Workspace)/drop/TestTemplate11.WorkerServices'
+
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download Artifact TestTemplate11.Migrations'
+          inputs:
+            buildType: 'specific'
+            definition: build_pipeline
+            buildVersionToDownload: 'latest'
+            artifactName: 'drop.TestTemplate11.Migrations'
+            project: '$(adoProject)'
+            downloadPath: '$(Pipeline.Workspace)/drop/TestTemplate11.Migrations'
+
+        - task: AzureCLI@2
+          displayName: 'Entra Api Registration'
+          name: 'entraApiRegistration'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/entraApiRegistration.ps1'
+            arguments: '$(PROJECT_NAME)'
+            powerShellErrorActionPreference: stop
+        
+        - task: AzureCLI@2
+          displayName: 'Provision Resource Group'
+          name: 'provisionResourceGroup'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/provisionResourceGroup.ps1'
+            arguments: '$(LOCATION) $(ENVIRONMENT) $(PROJECT_NAME)'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureCLI@2
+          displayName: 'Sql Entra-Only Auth - Disable'
+          name: 'SqlEntraOnlyAuthDisable'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/sqlEntraOnlyAuthDisable.ps1'
+            arguments: '$(provisionResourceGroup.resourceGroupName)'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureCLI@2
+          displayName: 'Provision Key Vault'
+          name: 'provisionKeyVault'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/provisionKeyVault.ps1'
+            arguments: '$(ENVIRONMENT) $(PROJECT_NAME) $(provisionResourceGroup.resourceGroupName)'
+            powerShellErrorActionPreference: stop
+            addSpnToEnvironment: true
+
+        - task: AzureCLI@2
+          displayName: 'Secrets'
+          name: 'secrets'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/secrets.ps1'
+            arguments: '$(provisionKeyVault.keyVaultName)'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureKeyVault@2
+          displayName: Azure Key Vault
+          inputs:
+            azureSubscription: 'AzureConnection'
+            KeyVaultName: '$(provisionKeyVault.keyVaultName)'
+            SecretsFilter: '*'
+            RunAsPreJob: false
+
+        - task: AzureCLI@2
+          displayName: 'Provision Resources'
+          name: 'provisionResources'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/provisionResources.ps1'
+            arguments: '$(ENVIRONMENT) $(PROJECT_NAME) $(provisionResourceGroup.resourceGroupName) $(SQL_ADMIN_USERNAME) $(SqlSaPassword) $(entraApiRegistration.authAuthority) $(entraApiRegistration.authAudience) $(entraApiRegistration.authValidIssuer) $(provisionKeyVault.vaultUri)'
+            powerShellErrorActionPreference: stop
+        
+        # Secrets.ps1 is used twice so as to store connection strings after the resources have been provisioned.
+        # It is idempotent so the secrets stored the first time will not be overwritten.
+        - task: AzureCLI@2
+          displayName: 'Secrets - Connection Strings'
+          name: 'secretsConnectionStrings'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/secrets.ps1'
+            arguments: '$(provisionKeyVault.keyVaultName) "$(provisionResources.dbConnection)" "$(provisionResources.messageBrokerConnectionString)" "$(provisionResources.appInsightsConnectionString)"'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureCLI@2
+          displayName: 'Create MSI and User Group'
+          name: 'msiUserGroups'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/msiUserGroups.ps1'
+            arguments: '$(USERS_GROUP_NAME) $(provisionResourceGroup.resourceGroupName) $(provisionResources.appServiceWebName)'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureCLI@2
+          displayName: 'Sql Entra Auth'
+          name: 'sqlEntraAuth'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/sqlEntraAuth.ps1'
+            arguments: '$(SQL_ADMIN_USERNAME) $(SqlAdminPassword) $(provisionResourceGroup.resourceGroupName) $(provisionResources.sqlServerName)'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureCLI@2
+          displayName: 'Sql Entra-Only Auth - Enable'
+          name: 'sqlEntraOnlyAuthEnable'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/sqlEntraOnlyAuthEnable.ps1'
+            arguments: '$(provisionResourceGroup.resourceGroupName)'
+            powerShellErrorActionPreference: stop
+          condition: always()
+            
+        - task: AzureCLI@2
+          displayName: 'Migrate database'
+          name: 'migrateDatabase'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            scriptType: pscore
+            scriptLocation: 'scriptPath'
+            scriptPath: './deployment/migrate.ps1'
+            arguments: '$(Pipeline.Workspace)/drop/TestTemplate11.Migrations/TestTemplate11.Migrations.dll "$(TestTemplate11DbConnection)" "$(sqlEntraAuth.sqlAdminUserPrincipalName)" "$(SqlAdminPassword)" $(Pipeline.Workspace)/drop/TestTemplate11.Migrations "$(USERS_GROUP_NAME)"'
+            powerShellErrorActionPreference: stop
+
+        - task: AzureWebApp@1
+          displayName: 'Deploy TestTemplate11.Api to App Service'
+          inputs:
+            azureSubscription: 'AzureConnection'
+            appType: 'webAppLinux'
+            appName: '$(provisionResources.appServiceWebName)'
+            resourceGroupName: '$(provisionResourceGroup.resourceGroupName)'
+            package: '$(Pipeline.Workspace)/drop/TestTemplate11.Api/**/*.zip'
+            runtimeStack: 'DOTNETCORE|6.0'
